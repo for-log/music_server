@@ -1,8 +1,6 @@
-use tokio::{
-    net::{TcpListener},
-};
-use crate::event::Event;
 use super::user::User;
+use crate::event::Event;
+use tokio::net::TcpListener;
 
 pub struct Server {
     listener: TcpListener,
@@ -11,20 +9,22 @@ pub struct Server {
 impl Server {
     pub async fn new(addr: String) -> Self {
         let listener = TcpListener::bind(addr).await.unwrap();
-        Self {listener}
+        Self { listener }
     }
     pub async fn accept(&mut self) {
         let (socket, _) = self.listener.accept().await.unwrap();
         let mut user = User::new(socket, "./audio.mp3".to_string()).await;
         tokio::spawn(async move {
-            loop {
+            while !user.is_close {
                 let data = user.read().await;
                 if Self::handle(&mut user, data).await == Event::Disconnect {
                     user.close();
                     break;
                 }
             }
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
     }
     async fn handle(user: &mut User, data: serde_json::value::Value) -> Event {
         match data.get("event") {
@@ -40,10 +40,10 @@ impl Server {
                         user.load_track(path.to_string()).await;
                         Event::Set
                     }
-                    _ => {Event::Disconnect}
+                    _ => Event::Disconnect,
                 }
             }
-            None => {Event::Disconnect}
+            None => Event::Disconnect,
         }
     }
 }
