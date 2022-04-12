@@ -1,49 +1,41 @@
 use super::user::User;
 use crate::event::Event;
-use tokio::net::TcpListener;
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use tokio::net::UdpSocket;
 
 pub struct Server {
-    listener: TcpListener,
+    listener: UdpSocket,
+    users: HashMap<SocketAddr, User>,
 }
 
 impl Server {
-    pub async fn new(addr: String) -> Self {
-        let listener = TcpListener::bind(addr).await.unwrap();
-        Self { listener }
+    pub async fn new(addr: String) -> Server {
+        let listener = UdpSocket::bind(addr).await.unwrap();
+        let users = HashMap::new();
+        Self { listener, users }
     }
-    pub async fn accept(&mut self) {
-        let (socket, _) = self.listener.accept().await.unwrap();
-        let mut user = User::new(socket, "./audio.mp3".to_string()).await;
-        tokio::spawn(async move {
-            while !user.is_close {
-                let data = user.read().await;
-                if Self::handle(&mut user, data).await == Event::Disconnect {
-                    user.close();
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-    }
-    async fn handle(user: &mut User, data: serde_json::value::Value) -> Event {
-        match data.get("event") {
-            Some(v) => {
-                let event = v.as_str().unwrap();
-                match event {
-                    "stream" => {
-                        user.thread_push().await;
-                        Event::Stream
-                    }
-                    "set" => {
-                        let path = data.get("track").unwrap().as_str().unwrap();
-                        user.load_track(path.to_string()).await;
-                        Event::Set
-                    }
-                    _ => Event::Disconnect,
-                }
-            }
-            None => Event::Disconnect,
+    pub async fn run(&mut self) {
+        let mut buf = [0u8; 1 << 12];
+        loop {
+            let v = Some(self.listener.recv_from(&mut buf).await.unwrap());
+            if let Some((size, addr)) = v {
+                let data: serde_json::value::Value = serde_json::from_slice(&buf[..size]).unwrap();
+                self.handle(addr, data).await;
+            };
         }
+    }
+    pub async fn handle(&mut self, addr: SocketAddr, data: serde_json::value::Value) {
+        let user = match self.users.contains_key(&addr) {
+            true => self.users.get_mut(&addr).unwrap(),
+            false => {
+                let _user = User::new(addr, "./audio.wav".to_owned());
+                self.users.insert(addr, _user);
+                self.users.get_mut(&addr).unwrap()
+            }
+        };
+        user.send_receive_status(&mut self.listener, Event::Ok)
+            .await;
+        user.thread_push(&mut self.listener).await;
     }
 }

@@ -1,118 +1,101 @@
 use super::constants::*;
 use super::event::Event;
-use minimp3::{Decoder, Error, Frame};
 use serde::Serialize;
 use serde_json::json;
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::TcpStream,
-};
+use std::fs::File;
+use std::net::SocketAddr;
+use tokio::net::UdpSocket;
+use wav::header::Header;
+
+const diff_size: usize = 1 << 12;
 
 pub struct User {
-    socket: TcpStream,
-    audio: Decoder<File>,
-    bytes_len: usize,
+    addr: SocketAddr,
+    audio: Vec<i16>,
+    header_audio: Header,
+    current_bits: usize,
     pub is_close: bool,
 }
 
 impl User {
-    pub async fn new(socket: TcpStream, path: String) -> Self {
-        let file = File::open(path).await.unwrap();
-        let audio = Decoder::new(file);
+    pub fn new(addr: SocketAddr, path: String) -> User {
+        let mut file = File::open(path).unwrap();
+        let (header_audio, a) = wav::read(&mut file).unwrap();
+        let audio = a.try_into_sixteen().unwrap().to_vec();
         Self {
-            socket,
+            addr,
             audio,
-            bytes_len: 0,
+            header_audio,
+            current_bits: 0,
             is_close: false,
         }
     }
-    pub async fn thread_push(&mut self) {
-        match self.audio.next_frame_future().await {
-            Ok(Frame {
-                data,
-                sample_rate,
-                channels,
-                ..
-            }) => {
-                self.send(&Self::create_event(
-                    Event::Data,
-                    &Self::serialize_data(&data, sample_rate, channels),
-                ))
-                .await;
-                self.bytes_len += data.len() / channels;
-            }
-            Err(Error::Eof) => self.send(&Self::create_event(Event::End, &"END")).await,
-            Err(e) => panic!("Error in thread_push: {:?}", e),
+    pub async fn thread_push(&mut self, writter: &mut UdpSocket) {
+        if self.current_bits >= self.audio.len() {
+            self.send(
+                writter,
+                &Self::create_event(Event::End, &"END")
+            ).await;
+            return;
         }
+        let data = self.audio[self.current_bits..self.current_bits + diff_size].to_vec();
+        self.send(
+            writter,
+            &Self::create_event(Event::Data, &self.serialize_data(&data)),
+        )
+        .await;
+        self.current_bits += diff_size;
     }
-    pub fn serialize_data(
-        data: &Vec<i16>,
-        sample_rate: i32,
-        channels: usize,
-    ) -> serde_json::value::Value {
-        let mut result = vec![0u8; data.len()];
-        let mut minus_index = vec![];
-        for i in 0..data.len() {
-            if data[i] < 0 {
-                minus_index.push(i);
-            }
-            result[i] = data[i].abs() as u8;
-        }
-        json!({
-            "data": result,
-            "munises": minus_index,
-            "sample_rate": sample_rate,
-            "channels": channels
-        })
+    pub fn serialize_data<Z: serde::Serialize>(&self, data: &Z) -> serde_json::value::Value {
+        json!({ 
+            "data": data,
+            "format": self.header_audio.audio_format,
+            "channels": self.header_audio.channel_count,
+            "rate": self.header_audio.sampling_rate
+         })
     }
-    pub fn create_event<T: Serialize>(event: Event, data: &T) -> serde_json::value::Value {
+    pub fn create_event<Z: Serialize>(event: Event, data: &Z) -> serde_json::value::Value {
         json!({
             "event": event as u32,
             "data": data
         })
     }
-    pub async fn send(&mut self, data: &serde_json::value::Value) {
-        match self
-            .socket
-            .write_all(format!("{}{}", data.to_string(), ENDBYTES).as_bytes())
+    pub async fn send(&mut self, writter: &mut UdpSocket, data: &serde_json::value::Value) {
+        let result_data = format!("{}{}", data.to_string(), ENDBYTES);
+        self.send_receive_len(writter, result_data.len()).await;
+        match writter.send_to(result_data.as_bytes(), self.addr).await {
+            Ok(_) => {}
+            Err(_) => self.close(),
+        };
+    }
+    pub async fn send_receive_status(&mut self, writter: &mut UdpSocket, status: Event) {
+        let data = Self::create_event(Event::Status, &(status as u32));
+        match writter
+            .send_to(data.to_string().as_bytes(), self.addr)
             .await
         {
             Ok(_) => {}
             Err(_) => self.close(),
         };
     }
-    pub async fn send_receive_status(&mut self, status: Event) {
-        let data = json!({
-            "event": "receive_status",
-            "status": status as u32
-        });
-        match self.socket.write_all(data.to_string().as_bytes()).await {
+    pub async fn send_receive_len(&mut self, writter: &mut UdpSocket, ln: usize) {
+        let data = Self::create_event(Event::Len, &ln);
+        match writter
+            .send_to(data.to_string().as_bytes(), self.addr)
+            .await
+        {
             Ok(_) => {}
             Err(_) => self.close(),
         };
     }
-    pub async fn read(&mut self) -> serde_json::value::Value {
-        let mut data = [0u8; 1 << 12];
-        match self.socket.read(&mut data).await {
-            Ok(n) => {
-                if n == 0 {
-                    return json!({"event": "disconnect"});
-                }
-                self.send_receive_status(Event::Ok).await;
-                serde_json::from_slice(&data[0..n]).unwrap()
-            }
-            Err(_) => panic!("Error in read user!"),
-        }
-    }
     pub async fn load_track(&mut self, path: String) {
-        let file = File::open(path).await.unwrap();
-        let audio = Decoder::new(file);
+        let mut file = File::open(path).unwrap();
+        let (header_audio, a) = wav::read(&mut file).unwrap();
+        let audio = a.try_into_sixteen().unwrap().to_vec();
         self.audio = audio;
-        self.bytes_len = 0;
+        self.header_audio = header_audio;
     }
     pub fn close(&mut self) {
-        self.socket.shutdown(std::net::Shutdown::Both).unwrap();
         self.is_close = true;
     }
 }
